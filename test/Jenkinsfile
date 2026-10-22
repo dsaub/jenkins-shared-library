@@ -1,0 +1,197 @@
+// Pipeline de prueba manual de mlib (no forma parte de la librería).
+//
+// En Jenkins: un job de tipo Pipeline, "Pipeline script from SCM" apuntando a este repositorio y
+// Script Path test/Jenkinsfile. Necesita:
+//   - agentes en línea con las etiquetas arm64 y amd64, con Docker y buildx;
+//   - una credencial usuario/contraseña con permiso para subir a IMAGE.
+// Sube a IMAGE las etiquetas mlib-test, mlib-test-emulated, <commit> y <commit>-<arch>. En el agente
+// arm64 crea y borra objetos de Docker llamados mlib-test-* y ejecuta cleanDocker.
+//
+// Al terminar, revisa en el log que la contraseña sale como **** y que no aparece el aviso
+// «A secret was passed to "sh" using Groovy String interpolation».
+//
+// Para probar una rama de mlib: @Library('mlib@mi-rama') _ (hace falta tener marcado
+// "Allow default version to be overridden" en la configuración de la librería).
+@Library('mlib') _
+
+pipeline {
+    agent none
+    parameters {
+        string(name: 'IMAGE', defaultValue: 'ghcr.io/dsaub/mlib-test',
+               description: 'Repositorio de pruebas, con el host del registro. Se le suben etiquetas.')
+        string(name: 'CREDENTIALS_ID', defaultValue: 'github-pat',
+               description: 'Credencial usuario/contraseña del registro')
+        booleanParam(name: 'TEST_EMULATION', defaultValue: true,
+                     description: 'Probar allowEmulation (necesita QEMU registrado en binfmt en el agente arm64)')
+    }
+    options {
+        disableConcurrentBuilds()
+        timeout(time: 1, unit: 'HOURS')
+    }
+    stages {
+        stage('Parámetros inválidos') {
+            steps {
+                script {
+                    expectFailure("etiqueta no válida 'mal;touch /tmp/mlib-inyectado'") {
+                        buildMultiArchImage(image: params.IMAGE, credentialsId: params.CREDENTIALS_ID,
+                                            tags: ['ok', 'mal;touch /tmp/mlib-inyectado'])
+                    }
+                    expectFailure('imagen no válida') {
+                        buildMultiArchImage(image: 'ghcr.io/dsaub/MLIB:latest', credentialsId: params.CREDENTIALS_ID)
+                    }
+                    expectFailure("parámetro desconocido 'imagen'") {
+                        buildMultiArchImage(imagen: params.IMAGE, credentialsId: params.CREDENTIALS_ID)
+                    }
+                    expectFailure("falta 'credentialsId'") {
+                        buildMultiArchImage(image: params.IMAGE)
+                    }
+                    expectFailure('minFreeGb') { checkDiskSpace(minFreeGb: 'mucho') }
+                    expectFailure('olderThan') { cleanDocker(olderThan: '3d') }
+                    // Fuera de un nodo no puede limpiar nada, pero tampoco puede hacer fallar el build.
+                    cleanDocker()
+                }
+            }
+        }
+
+        stage('Disco y limpieza (una arquitectura)') {
+            agent { label 'arm64' }
+            steps {
+                script {
+                    if (checkDiskSpace(minFreeGb: 1) == null) {
+                        error('checkDiskSpace no ha podido leer el espacio libre')
+                    }
+                    expectFailure('Solo quedan') { checkDiskSpace(minFreeGb: 999999) }
+                    if (checkDiskSpace(path: '/mlib/no/existe') != null) {
+                        error('Con una ruta que no existe tenía que avisar y devolver null')
+                    }
+                    // Un volumen, una imagen con etiqueta y una colgante: cleanDocker solo puede borrar la colgante.
+                    sh '''
+                        docker volume create mlib-test-sentinel
+                        docker buildx build --ulimit core=0 --provenance=false --load -t mlib-test-sentinel:keep test
+                        docker buildx build --ulimit core=0 --provenance=false --load -t mlib-test-dangling:x \
+                            --build-arg MLIB_TEST_MESSAGE=uno test
+                        docker image inspect -f '{{.Id}}' mlib-test-dangling:x > mlib-dangling-id
+                        docker buildx build --ulimit core=0 --provenance=false --load -t mlib-test-dangling:x \
+                            --build-arg MLIB_TEST_MESSAGE=dos test
+                    '''
+                    cleanDocker()
+                    sh '''
+                        docker volume inspect mlib-test-sentinel >/dev/null
+                        docker image inspect mlib-test-sentinel:keep >/dev/null
+                        if docker image inspect "$(cat mlib-dangling-id)" >/dev/null 2>&1; then
+                            echo "La imagen colgante sigue ahí: cleanDocker no la ha borrado" >&2
+                            exit 1
+                        fi
+                        echo "OK: cleanDocker ha borrado la imagen colgante y ha respetado el volumen y la imagen con etiqueta"
+                    '''
+                }
+            }
+            post {
+                always {
+                    sh 'docker image rm mlib-test-sentinel:keep mlib-test-dangling:x || true; docker volume rm mlib-test-sentinel || true'
+                }
+            }
+        }
+
+        stage('Multiarquitectura nativa') {
+            steps {
+                script {
+                    List refs = buildMultiArchImage(
+                        image: params.IMAGE,
+                        tags: ['mlib-test'],
+                        credentialsId: params.CREDENTIALS_ID,
+                        context: 'test',
+                        buildArgs: [MLIB_TEST_MESSAGE: "build ${env.BUILD_NUMBER} con 'comillas', \$(esto no se ejecuta); y espacios"]
+                    )
+                    if (refs.size() != 2 || refs[0] != params.IMAGE + ':mlib-test') {
+                        error("Referencias inesperadas: ${refs}")
+                    }
+                    checkManifest(refs[0], ['linux/arm64', 'linux/amd64'])
+                }
+            }
+        }
+
+        stage('Falta un agente') {
+            steps {
+                script {
+                    expectFailure("etiqueta 'mlib-no-such-agent'") {
+                        buildMultiArchImage(image: params.IMAGE, credentialsId: params.CREDENTIALS_ID, context: 'test',
+                                            agents: ['linux/amd64': 'mlib-no-such-agent'], agentTimeoutMinutes: 1)
+                    }
+                }
+            }
+        }
+
+        stage('Etiqueta mal puesta') {
+            steps {
+                script {
+                    // amd64 se manda al agente arm64: sin allowEmulation tiene que negarse a emular.
+                    expectFailure('se construiría emulada') {
+                        buildMultiArchImage(image: params.IMAGE, credentialsId: params.CREDENTIALS_ID, context: 'test',
+                                            agents: ['linux/amd64': 'arm64'])
+                    }
+                }
+            }
+        }
+
+        stage('Emulación permitida') {
+            when { expression { params.TEST_EMULATION } }
+            steps {
+                script {
+                    List refs = buildMultiArchImage(
+                        image: params.IMAGE,
+                        tags: ['mlib-test-emulated'],
+                        credentialsId: params.CREDENTIALS_ID,
+                        context: 'test',
+                        agents: ['linux/amd64': 'mlib-no-such-agent'],
+                        allowEmulation: true,
+                        agentTimeoutMinutes: 1
+                    )
+                    checkManifest(refs[0], ['linux/arm64', 'linux/amd64'])
+                }
+            }
+        }
+    }
+}
+
+// Ejecuta el bloque y comprueba que falla con un mensaje que contiene 'expected'.
+def expectFailure(String expected, Closure body) {
+    try {
+        body()
+    } catch (hudson.AbortException e) {
+        if (!e.message.contains(expected)) {
+            error("Ha fallado, pero con otro mensaje: ${e.message}")
+        }
+        echo "OK, falla como se esperaba: ${e.message}"
+        return
+    }
+    error("Tenía que fallar con «${expected}» y no ha fallado")
+}
+
+// Comprueba en el registro que el manifiesto publicado tiene todas las plataformas.
+def checkManifest(String ref, List platforms) {
+    String first = ref.substring(0, ref.indexOf('/'))
+    String registry = (first.contains('.') || first.contains(':') || first == 'localhost') ? first : 'docker.io'
+    node('arm64') {
+        withCredentials([usernamePassword(credentialsId: params.CREDENTIALS_ID,
+                                          usernameVariable: 'REG_USER', passwordVariable: 'REG_PASSWORD')]) {
+            withEnv(["MLIB_TEST_REF=${ref}", "MLIB_TEST_REGISTRY=${registry}"]) {
+                String manifest = sh(returnStdout: true, label: 'imagetools inspect', script: '''
+                    config="${DOCKER_CONFIG:-$HOME/.docker}"
+                    DOCKER_CONFIG="$(mktemp -d)"
+                    export DOCKER_CONFIG
+                    trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+                    if [ -e "$config/cli-plugins" ]; then ln -s "$config/cli-plugins" "$DOCKER_CONFIG/cli-plugins"; fi
+                    printf '%s' "$REG_PASSWORD" | docker login "$MLIB_TEST_REGISTRY" -u "$REG_USER" --password-stdin >/dev/null
+                    docker buildx imagetools inspect "$MLIB_TEST_REF"
+                ''')
+                for (int i = 0; i < platforms.size(); i++) {
+                    if (!manifest.contains(platforms[i])) {
+                        error("El manifiesto de ${ref} no tiene ${platforms[i]}:\n${manifest}")
+                    }
+                }
+                echo "OK: ${ref} tiene ${platforms.join(', ')}"
+            }
+        }
+    }
+}
