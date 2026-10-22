@@ -35,13 +35,14 @@ Desde un clon local: `/plugin marketplace add /ruta/a/jenkins-shared-library`. P
 | `buildMultiArchImage(image: …, credentialsId: …)` | Imagen multiarquitectura construida **sin emulación**: cada arquitectura en un agente de esa arquitectura |
 | `checkDiskSpace(minFreeGb: 10, path: '/')` | Falla si en el nodo queda menos espacio libre del indicado |
 | `cleanDocker(olderThan: '72h', danglingImages: true)` | Limpia la caché de build y las imágenes colgantes tras el build |
-| `dockerPushGhcr(imageName, credentialsId = 'github-pat')` | `docker login` en ghcr.io, `docker push` y `docker logout` |
+| `prepareDaytona()` | Crea un sandbox x86_64 de Daytona con Docker (descarga la CLI si falta) y devuelve su ID |
+| `dockerPushGhcr(imageName, credentialsId = 'github-pat', mode = null, sandboxId = null)` | `docker login` en ghcr.io, `docker push` y `docker logout`, en el nodo o en el sandbox |
 | `lintDockerfile(dockerfilePath = 'Dockerfile')` | Hadolint |
 | `runSonar(serverName = 'SonarQube', waitForQualityGate = false)` | Análisis de SonarQube |
 | `scanImage(imageName, exitCode = 0)` | Trivy (HIGH y CRITICAL) |
 | `scanSecrets()` | Gitleaks |
 
-Los tres primeros reciben los parámetros con nombre (un `Map`). Si pasas un parámetro que no existe,
+`buildMultiArchImage`, `checkDiskSpace`, `cleanDocker` y `prepareDaytona` reciben los parámetros con nombre (un `Map`). Si pasas un parámetro que no existe,
 por ejemplo por una errata, el paso falla en vez de ignorarlo.
 
 ## buildMultiArchImage
@@ -83,6 +84,19 @@ Lo que hace:
 | `allowEmulation` | no | `false` | Ver [Si falta un agente](#si-falta-un-agente) |
 | `minFreeGb` | no | `10` | Se pasa a `checkDiskSpace` en cada agente |
 | `agentTimeoutMinutes` | no | `10` | Espera máxima por un agente, cuando no se puede saber de antemano si existe |
+| `mode` | no | — | `'emulation'` (como `allowEmulation: true`) o `'sandboxing'` (`linux/amd64` en el sandbox de Daytona) |
+| `sandboxId` | con `'sandboxing'` | — | El ID que devuelve `prepareDaytona()` |
+
+Si tus agentes son solo ARM, construye `linux/amd64` en Daytona en vez de emularlo:
+
+```groovy
+def sandbox = prepareDaytona()   // en un nodo; credencial Secret text 'daytona-token'
+buildMultiArchImage(image: 'ghcr.io/dsaub/app', credentialsId: 'ghcr', mode: 'sandboxing', sandboxId: sandbox)
+prepareDaytona.delete(sandbox)   // en post { always { … } }
+```
+
+Detalles en [docs/prepareDaytona.md](docs/prepareDaytona.md) y
+[docs/buildMultiArchImage.md](docs/buildMultiArchImage.md#modo-sandboxing).
 
 ```groovy
 @Library('mlib') _
