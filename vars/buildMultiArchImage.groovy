@@ -39,7 +39,7 @@ def call(Map config = [:]) {
         error("Las plataformas se han construido desde commits distintos (${commitTags.join(', ')}): no creo el manifiesto.")
     }
     List refs = finalRefs(cfg, commitTags[0])
-    node(targets[0].label) {
+    onNode(targets[0].label) {
         registrySh(cfg, 'docker buildx imagetools create', manifestCommand(refs, sourceRefs(targets, results)))
     }
     echo "Publicada: ${refs.join(', ')}"
@@ -47,9 +47,10 @@ def call(Map config = [:]) {
 }
 
 // Decide en qué agente se construye cada plataforma antes de construir nada. Si falta el de alguna,
-// falla; con allowEmulation, la construye emulada en el agente de otra plataforma.
+// falla; con allowEmulation, la construye emulada en el agente de otra plataforma. Con mode
+// 'sandboxing', linux/amd64 se construye en el sandbox de Daytona, manejado desde otro agente.
 private List planTargets(Map cfg) {
-    List labels = distinctLabels(cfg.platforms, cfg.agents)
+    List labels = distinctLabels(agentPlatforms(cfg), cfg.agents)
     Map status = checkAgents(labels, cfg.agentTimeoutMinutes)
     String host = firstAvailable(labels, status)
 
@@ -57,6 +58,12 @@ private List planTargets(Map cfg) {
     List missing = []
     for (int i = 0; i < cfg.platforms.size(); i++) {
         String platform = cfg.platforms[i]
+        if (isSandboxed(cfg, platform)) {
+            // host null: cualquier agente sirve para usar la CLI de Daytona.
+            targets.add([platform: platform, arch: archOf(platform), suffix: suffixOf(platform),
+                         label: host, emulated: false, sandbox: true])
+            continue
+        }
         String label = cfg.agents[platform]
         boolean available = status[label] == 'ok'
         String reason = available ? null : missingReason(label, status[label], cfg.agentTimeoutMinutes)
@@ -135,8 +142,20 @@ private boolean probeAgent(String label, int timeoutMinutes) {
     }
 }
 
+// node(label), o cualquier agente si label es null.
+private void onNode(String label, Closure body) {
+    if (label != null) {
+        node(label, body)
+    } else {
+        node(body)
+    }
+}
+
 // Construye y sube una plataforma en su agente. Al terminar limpia Docker, también si el build falla.
 private Map buildTarget(Map cfg, Map target) {
+    if (target.sandbox) {
+        return buildInSandbox(cfg, target)
+    }
     Map result = [:]
     node(target.label) {
         // Fuera del try: si el nodo está mal etiquetado, la rama falla al momento (aún no hay nada que
@@ -156,6 +175,80 @@ private Map buildTarget(Map cfg, Map target) {
         }
     }
     return result
+}
+
+// Construye y sube la plataforma en el sandbox de Daytona. El agente hace checkout solo para saber
+// el commit y la URL del repositorio: el sandbox clona ese mismo commit, se conecta al registro con
+// un DOCKER_CONFIG temporal, construye con buildx, sube y limpia, también si el build falla.
+private Map buildInSandbox(Map cfg, Map target) {
+    Map result = [:]
+    onNode(target.label) {
+        def scmVars = checkout(scm)
+        String commitTag = commitTagOf(scmVars)
+        String ref = cfg.image + ':' + commitTag + '-' + target.suffix
+        String repoUrl = sh(script: 'git config --get remote.origin.url', returnStdout: true,
+                            label: 'URL del repositorio').trim()
+        String commit = sh(script: 'git rev-parse HEAD', returnStdout: true, label: 'Commit').trim()
+        List envNames = ['MLIB_REPO_URL', 'MLIB_COMMIT', 'MLIB_REGISTRY_USER', 'MLIB_REGISTRY_PASSWORD']
+        List creds = [usernamePassword(credentialsId: cfg.credentialsId,
+                                       usernameVariable: 'MLIB_REGISTRY_USER',
+                                       passwordVariable: 'MLIB_REGISTRY_PASSWORD')]
+        if (cfg.gitCredentialsId != null) {
+            creds.add(usernamePassword(credentialsId: cfg.gitCredentialsId,
+                                       usernameVariable: 'MLIB_GIT_USER',
+                                       passwordVariable: 'MLIB_GIT_PASSWORD'))
+            envNames.addAll(['MLIB_GIT_USER', 'MLIB_GIT_PASSWORD'])
+        }
+        echo "Construyo ${target.platform} en el sandbox de Daytona ${cfg.sandboxId} (commit ${commit})."
+        withEnv(["MLIB_REPO_URL=${repoUrl}", "MLIB_COMMIT=${commit}"]) {
+            withCredentials(creds) {
+                prepareDaytona.exec(cfg.sandboxId, "docker buildx build ${target.platform} (Daytona)",
+                                    sandboxBuildScript(cfg, target, ref), envNames, cfg.daytonaCredentialsId)
+            }
+        }
+        result.commitTag = commitTag
+        result.ref = ref
+    }
+    return result
+}
+
+@NonCPS
+private String sandboxBuildScript(Map cfg, Map target, String ref) {
+    String server = cfg.registry == 'docker.io' ? '' : ' ' + shellQuote(cfg.registry)
+    return [
+        'mlib_arch="$(docker version --format \'{{.Server.Arch}}\')"',
+        "if [ \"\$mlib_arch\" != ${shellQuote(target.arch)} ]; then",
+        "  echo \"El Docker del sandbox es \$mlib_arch, no ${target.arch}\" >&2",
+        '  exit 1',
+        'fi',
+        'mlib_work="$(mktemp -d)"',
+        'DOCKER_CONFIG="$(mktemp -d)"',
+        'export DOCKER_CONFIG',
+        'mlib_end() {',
+        '  mlib_status=$?',
+        '  docker logout' + server + ' >/dev/null 2>&1 || true',
+        '  rm -rf "$mlib_work" "$DOCKER_CONFIG"',
+        '  docker image rm ' + shellQuote(ref) + ' >/dev/null 2>&1 || true',
+        '  docker builder prune -f --filter until=72h >/dev/null 2>&1 || true',
+        '  docker image prune -f >/dev/null 2>&1 || true',
+        '  exit "$mlib_status"',
+        '}',
+        'trap mlib_end EXIT',
+        // El sandbox no tiene claves SSH: git@host:ruta se clona por HTTPS.
+        'case "$MLIB_REPO_URL" in',
+        '  git@*:*) MLIB_REPO_URL="https://$(printf \'%s\' "${MLIB_REPO_URL#git@}" | sed \'s#:#/#\')" ;;',
+        'esac',
+        'if [ -n "${MLIB_GIT_USER:-}" ]; then',
+        '  mlib_auth="$(printf \'%s:%s\' "$MLIB_GIT_USER" "$MLIB_GIT_PASSWORD" | base64 | tr -d \'\\n\')"',
+        '  git -c http.extraHeader="Authorization: Basic $mlib_auth" clone -q "$MLIB_REPO_URL" "$mlib_work/src"',
+        'else',
+        '  git clone -q "$MLIB_REPO_URL" "$mlib_work/src"',
+        'fi',
+        'cd "$mlib_work/src"',
+        'git -c advice.detachedHead=false checkout -q "$MLIB_COMMIT"',
+        'printf \'%s\' "$MLIB_REGISTRY_PASSWORD" | docker login' + server + ' -u "$MLIB_REGISTRY_USER" --password-stdin',
+        buildCommand(cfg, target.platform, ref)
+    ].join('\n')
 }
 
 // <commit>: los 12 primeros caracteres del commit que se ha construido; sin commit, el número de build.
@@ -290,7 +383,8 @@ private String shellQuote(String value) {
 private Map parseConfig(Map config) {
     List problems = []
     List known = ['image', 'tags', 'platforms', 'agents', 'credentialsId', 'registry', 'dockerfile',
-                  'context', 'buildArgs', 'allowEmulation', 'minFreeGb', 'agentTimeoutMinutes']
+                  'context', 'buildArgs', 'allowEmulation', 'minFreeGb', 'agentTimeoutMinutes',
+                  'mode', 'sandboxId', 'daytonaCredentialsId', 'gitCredentialsId']
     config.keySet().findAll { !known.contains(it) }.each { problems.add("parámetro desconocido '${it}'".toString()) }
 
     String image = textOf(config.image)
@@ -353,10 +447,32 @@ private Map parseConfig(Map config) {
         problems.add("'buildArgs' debe ser un Map")
     }
 
-    def allowEmulation = config.allowEmulation != null ? config.allowEmulation : false
+    // mode 'emulation' equivale a allowEmulation: true; 'sandboxing' manda linux/amd64 a Daytona.
+    String mode = textOf(config.mode)
+    if (mode != null && !(mode in ['emulation', 'sandboxing'])) {
+        problems.add("'mode' debe ser 'emulation' o 'sandboxing', no '${mode}'".toString())
+    }
+    def allowEmulation = config.allowEmulation != null ? config.allowEmulation : (mode == 'emulation')
     if (!(allowEmulation instanceof Boolean)) {
         problems.add("'allowEmulation' debe ser true o false")
+    } else if (mode == 'emulation' && !allowEmulation) {
+        problems.add("mode 'emulation' no se puede combinar con allowEmulation: false")
     }
+    String sandboxId = textOf(config.sandboxId)
+    if (mode == 'sandboxing') {
+        if (sandboxId == null) {
+            problems.add("mode 'sandboxing' necesita 'sandboxId' (el que devuelve prepareDaytona())")
+        } else if (!(sandboxId ==~ /[A-Za-z0-9][A-Za-z0-9._-]{0,127}/)) {
+            problems.add("sandboxId no válido '${sandboxId}'".toString())
+        }
+        if (!platforms.contains('linux/amd64')) {
+            problems.add("mode 'sandboxing' construye linux/amd64, que no está en 'platforms'")
+        }
+    } else if (sandboxId != null) {
+        problems.add("'sandboxId' solo se usa con mode: 'sandboxing'")
+    }
+    String daytonaCredentialsId = textOf(config.daytonaCredentialsId) ?: 'daytona-token'
+    String gitCredentialsId = textOf(config.gitCredentialsId)
     Integer minFreeGb = wholeNumber(config.minFreeGb, 10)
     if (minFreeGb == null) {
         problems.add("'minFreeGb' debe ser un número entero de GB")
@@ -369,7 +485,20 @@ private Map parseConfig(Map config) {
     return [problems: problems, image: image, tags: distinct(tags), platforms: platforms,
             agents: agents, credentialsId: credentialsId, registry: registry, dockerfile: dockerfile,
             context: context, buildArgs: buildArgs, allowEmulation: allowEmulation, minFreeGb: minFreeGb,
-            agentTimeoutMinutes: agentTimeoutMinutes]
+            agentTimeoutMinutes: agentTimeoutMinutes, mode: mode, sandboxId: sandboxId,
+            daytonaCredentialsId: daytonaCredentialsId, gitCredentialsId: gitCredentialsId]
+}
+
+// El sandbox de Daytona es x86_64: solo linux/amd64 se construye allí.
+@NonCPS
+private boolean isSandboxed(Map cfg, String platform) {
+    return cfg.mode == 'sandboxing' && platform == 'linux/amd64'
+}
+
+// Plataformas que necesitan un agente propio (las que no van al sandbox).
+@NonCPS
+private List agentPlatforms(Map cfg) {
+    return cfg.platforms.findAll { !isSandboxed(cfg, it) }
 }
 
 // El registro es el primer componente del nombre si parece un host (lleva '.' o ':', o es localhost).
@@ -421,7 +550,10 @@ private String firstAvailable(List labels, Map status) {
 
 @NonCPS
 private String planSummary(List targets) {
-    return targets.collect { it.platform + " en '" + it.label + "'" + (it.emulated ? ' (emulada)' : '') }.join(', ')
+    return targets.collect {
+        it.sandbox ? it.platform + ' en el sandbox de Daytona' :
+            it.platform + " en '" + it.label + "'" + (it.emulated ? ' (emulada)' : '')
+    }.join(', ')
 }
 
 @NonCPS
