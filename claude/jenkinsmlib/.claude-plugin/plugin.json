@@ -1,0 +1,9 @@
+{
+  "name": "jenkinsmlib",
+  "version": "1.0.0",
+  "description": "Skill /jenkinsmlib: indica al agente dónde está la documentación de la shared library de Jenkins mlib",
+  "author": {
+    "name": "dsaub"
+  },
+  "repository": "https://github.com/dsaub/jenkins-shared-library"
+}

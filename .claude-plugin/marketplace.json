@@ -1,0 +1,14 @@
+{
+  "name": "mlib",
+  "description": "Plugins de Claude Code para la shared library de Jenkins mlib",
+  "owner": {
+    "name": "dsaub"
+  },
+  "plugins": [
+    {
+      "name": "jenkinsmlib",
+      "source": "./claude/jenkinsmlib",
+      "description": "Documentación de la shared library de Jenkins mlib para el agente"
+    }
+  ]
+}
